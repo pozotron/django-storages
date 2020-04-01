@@ -15,6 +15,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 from google.cloud.exceptions import Conflict, NotFound
 from google.cloud.storage.blob import Blob
+from google.api_core import exceptions
 
 from storages.backends import gcloud
 
@@ -28,6 +29,13 @@ class GCloudTestCase(TestCase):
 
         self.client_patcher = mock.patch('storages.backends.gcloud.Client')
         self.client_patcher.start()
+
+        self.retry_side_effects = 50 * [
+            exceptions.TooManyRequests('possible error'),
+            exceptions.InternalServerError('another one'),
+            exceptions.ServiceUnavailable('and another'),
+            None,
+        ]
 
     def tearDown(self):
         self.client_patcher.stop()
@@ -465,3 +473,126 @@ class GCloudStorageTests(GCloudTestCase):
         self.assertEqual(storage.location, 'foo1')
         storage = gcloud.GoogleCloudStorage(location='foo2')
         self.assertEqual(storage.location, 'foo2')
+
+    @mock.patch("storages.backends.gcloud.GoogleCloudFile")
+    def test_server_error_fails_request(self, file_mock):
+        # Fails as retry is not activated
+        data = "Some test data"
+        content = ContentFile(data)
+
+        file_mock.return_value.blob.upload_from_file.side_effect = self.retry_side_effects
+
+        with self.assertRaises(exceptions.TooManyRequests):
+            for _ in self.retry_side_effects:
+                self.storage.save(self.filename, content)
+
+    def test_using_custom_retryable(self):
+        class SomeTransientException1(Exception):
+            pass
+
+        class SomeTransientException2(Exception):
+            pass
+
+        storage = gcloud.GoogleCloudStorage(retry=True, initial_delay=0.01, max_delay=0.02,
+                                            retryable=(SomeTransientException1, SomeTransientException2))
+
+        side_effects = [SomeTransientException1, SomeTransientException2] * 2
+        side_effects.append(None)
+
+        bucket_mock = mock.MagicMock()
+        get_blob_mock = mock.MagicMock(side_effect=side_effects)
+        bucket_mock.get_blob = storage.retry_handler(get_blob_mock)
+        storage._bucket = bucket_mock
+
+        storage.exists(self.filename)
+
+        self.assertEqual(get_blob_mock.call_count, 5)
+
+    @mock.patch("storages.backends.gcloud.Client.return_value")
+    def test_complete_failed_request_file(self, client_mock):
+        storage = gcloud.GoogleCloudStorage(retry=True, initial_delay=0.01, max_delay=0.02)
+        data = "Some test data"
+        content = ContentFile(data)
+
+        bucket_mock = client_mock.bucket.return_value
+        delete_blob_mock = bucket_mock.delete_blob
+        blob_mock = bucket_mock.get_blob.return_value
+        upload_mock = blob_mock.upload_from_file
+        download_mock = blob_mock.download_to_file
+
+        delete_blob_mock.side_effect = self.retry_side_effects
+        upload_mock.side_effect = self.retry_side_effects
+        download_mock.side_effect = self.retry_side_effects
+
+        gfile = gcloud.GoogleCloudFile(self.filename, 'rw', storage)
+        gfile.read()
+        gfile.write(content)
+        gfile.close()
+
+        storage.open(self.filename)
+        storage.save(self.filename, content)
+        storage.delete(self.filename)
+
+        self.assertEqual(upload_mock.call_count, 8)
+        self.assertEqual(download_mock.call_count, 4)
+        self.assertEqual(delete_blob_mock.call_count, 4)
+
+    @mock.patch("storages.backends.gcloud.Client.return_value")
+    def test_complete_failed_request_file_info(self, client_mock):
+        storage = gcloud.GoogleCloudStorage(retry=True, initial_delay=0.01, max_delay=0.02)
+
+        get_blob_mock = mock.MagicMock(side_effect=self.retry_side_effects)
+        client_mock.bucket.return_value.get_blob = get_blob_mock
+
+        with self.assertRaises(NotFound):
+            storage.size(self.filename)
+            storage.modified_time(self.filename)
+            storage.get_modified_time(self.filename)
+            storage.get_created_time(self.filename)
+            storage.exists(self.filename)
+
+    @mock.patch("storages.backends.gcloud.Client.return_value")
+    def test_complete_failed_request_bucket_managing(self, client_mock):
+        storage = gcloud.GoogleCloudStorage(retry=True, initial_delay=0.01, max_delay=0.02, auto_create_bucket=True)
+
+        # "None" from the original list isn't acceptable here
+        local_side_effects = self.retry_side_effects[:4]
+        local_side_effects[-1] = mock.MagicMock()
+
+        create_mock = client_mock.create_bucket
+        create_mock.side_effects = local_side_effects
+        get_mock = client_mock.get_bucket
+        get_mock.side_effects = local_side_effects
+
+        storage.exists(None)
+
+        create_mock.assert_called_once()
+        get_mock.assert_called_once()
+
+    @mock.patch.object(gcloud.GoogleCloudStorage, "_get_blobs")
+    def test_complete_failed_request_dirs(self, get_blobs_mock):
+        storage = gcloud.GoogleCloudStorage(retry=True, initial_delay=0.01, max_delay=0.02)
+
+        file_names = ["some/path/1.txt", "2.txt", "other/path/3.txt", "4.txt"]
+        subdir = ""
+
+        blobs, prefixes = [], []
+        for name in file_names:
+            directory = name.rsplit("/", 1)[0] + "/" if "/" in name else ""
+            if directory == subdir:
+                blob = mock.MagicMock(spec=Blob)
+                blob.name = name.split("/")[-1]
+                blobs.append(blob)
+            else:
+                prefixes.append(directory.split("/")[0] + "/")
+
+        return_value = [prefixes, blobs]
+        side_effects = self.retry_side_effects[:3]
+        side_effects.append(return_value)
+        get_blobs_mock.side_effect = side_effects
+
+        dirs, files = storage.listdir(subdir)
+
+        self.assertEqual(len(files), 2)
+        self.assertEqual(len(dirs), 2)
+        self.assertEqual(get_blobs_mock.call_count, 4)

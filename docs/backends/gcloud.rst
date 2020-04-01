@@ -185,6 +185,37 @@ Note: Default Google Compute Engine (GCE) Service accounts are
 The ``GS_EXPIRATION`` value is handled by the underlying `Google library  <https://googlecloudplatform.github.io/google-cloud-python/latest/storage/blobs.html#google.cloud.storage.blob.Blob.generate_signed_url>`_.
 It supports `timedelta`, `datetime`, or `integer` seconds since epoch time.
 
+``GS_RETRY`` (optional: default is ``False``)
+
+Enables Google's exponential backoff algorithm to handle requests that were failed
+due to some transient server side errors (TooManyRequests, ServiceUnavailable, InternalServerError).
+If all such errors are handled, but there is still no available reply, and the deadline is
+already exceeded, then it raises `google.api_core.RetryError`.
+Retrying failed requests is `recommended by Google <https://cloud.google.com/storage/docs/key-terms#immutability>`_
+for some `specific errors <https://cloud.google.com/apis/design/errors#error_retries>`_.
+
+``GS_INITIAL_DELAY`` (optional: default is ``1.0``)
+
+Specifies the initial time in seconds, which is the minimum when calculating
+the next time to delay. This time may vary for
+`different exceptions <https://cloud.google.com/apis/design/errors#error_retries>`_.
+
+``GS_MAX_DELAY`` (optional: default is ``60.0``)
+
+Represents time in seconds, which is the maximum when calculating the next time to delay.
+
+``GS_DEADLINE`` (optional: default is ``120.0``)
+
+Time in seconds. Determines how long the algorithm should retry before giving up.
+Keep in mind, that the last sleeping time is shortened to meet the deadline -
+the last retry runs just at the deadline.
+
+``GS_RETRYABLE`` (optional: default is `Tuple[google.api_core.exceptions.InternalServerError,
+google.api_core.exceptions.TooManyRequests, google.api_core.exceptions.ServiceUnavailable]`)
+
+A tuple/list of exception types to apply retry strategy to. Keep in mind,
+that not all exceptions are retryable. To learn more about what exceptions are retryable and
+what are not check out `Google's retry handling strategy <https://cloud.google.com/storage/docs/gsutil/addlhelp/RetryHandlingStrategy#retry-strategy_1>`_.
 
 Usage
 -----
